@@ -46,14 +46,20 @@ env:
 jobs:
   apk:
     runs-on: ubuntu-latest
+    env:
+      WANTED: ${{ github.event.inputs.zip }}
+      B64: ${{ secrets.KEYSTORE_BASE64 }}
+      SP: ${{ secrets.KEYSTORE_PASSWORD }}
+      KA: ${{ secrets.KEY_ALIAS }}
+      KP: ${{ secrets.KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+      NOTES: ${{ github.event.head_commit.message }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Find the Aura project
-        env:
-          WANTED: ${{ github.event.inputs.zip }}
         run: |
           set -e
           f="$WANTED"
@@ -66,36 +72,4 @@ jobs:
           fi
           rm -rf project
           mkdir project
-          if [ -n "$f" ] && [ -f "$f" ]; then
-            echo "Using zip: $f"
-            unzip -q -o "$f" -d project
-            name=$(basename "$f")
-            name=$(printf '%s' "${name%.*}" | tr -c 'A-Za-z0-9._-' '_')
-          elif [ -f launcher/src/main/AndroidManifest.xml ]; then
-            echo "No zip in the repo: building the project files in the repo itself"
-            cp -r launcher project/launcher
-            name=Aura
-          else
-            echo "::error::No zip file found in the repo, and no launcher/ folder either"
-            exit 1
-          fi
-          m=$(find project -path '*launcher/src/main/AndroidManifest.xml' | awk '{ print length($0) " " $0 }' | sort -n | head -1 | cut -d' ' -f2-)
-          if [ -z "$m" ]; then
-            echo "::error::No launcher/src/main/AndroidManifest.xml in that zip - is it the Aura project?"
-            exit 1
-          fi
-          echo "SRC=$PWD/$(dirname "$m")" >> "$GITHUB_ENV"
-          echo "NAME=$name" >> "$GITHUB_ENV"
-          echo "Project source: $(dirname "$m")"
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-
-      - name: Build number
-        run: echo "CODE=$(( $(date +%s) / 60 ))" >> "$GITHUB_ENV"
-
-      - name: Signing key
-        env:
-          B64: ${{ secrets.KEYSTORE_BASE64 }}
+          if [ -n "$f" ] && [ -f "$f" ]; t
