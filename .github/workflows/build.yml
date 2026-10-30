@@ -1,32 +1,20 @@
 name: build-apk
 
-# AURA TV BUILD
-# Put this file in your repo at .github/workflows/build.yml (once).
-# Then upload the Aura project as a .zip to the repo (phone: Add file -> Upload files).
-# The newest zip is unpacked and built; the signed APK appears under the run's "Artifacts".
-# No zip in the repo? Then the Aura project files in the repo itself (launcher/ at the top) are built.
-#
-# Aura is not a Gradle project: it is built with the Android SDK tools directly
-# (aapt2 -> javac -> d8 -> zipalign -> apksigner), exactly like tools/build.ps1 does on a PC.
-#
-# One-time setup: add the secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD.
-# Without them the build still works, but with a throwaway key: installing an update then needs an
-# uninstall first, and no release is published (Aura's in-app updater would not be able to install it).
-# Run an older zip again: Actions -> build-apk -> Run workflow -> type the zip's file name.
-#
-# In-app updates: Aura checks the latest GitHub Release of the repo it was built from, and the build
-# points it at THIS repo. The repo must be public for the TV to read it.
+# Aura is a plain Android framework app, not a Gradle project.
+# Build pipeline: aapt2 -> javac -> d8 -> zipalign -> apksigner.
 
 on:
   push:
     paths:
       - '**.zip'
-      - '**.git'
+      - '**/*.zip'
+      - 'launcher/**'
       - '.github/workflows/build.yml'
+
   workflow_dispatch:
     inputs:
       zip:
-        description: 'Zip file to build (leave empty for the newest one)'
+        description: 'ZIP file to build (leave empty to use the newest committed ZIP)'
         required: false
         default: ''
 
@@ -39,37 +27,364 @@ concurrency:
 
 env:
   JAVA_VERSION: '17'
-  VERSION_PREFIX: '1.0'          # versionName becomes <prefix>.<build number>, e.g. 1.0.29612345
+  VERSION_PREFIX: '1.0'
   MIN_SDK: '26'
-  TARGET_SDK: '28'               # on purpose: from 29 Android only lets system apps change Wi-Fi (Control Center needs it)
+  TARGET_SDK: '28'
 
 jobs:
   apk:
     runs-on: ubuntu-latest
+
     env:
       WANTED: ${{ github.event.inputs.zip }}
-      B64: ${{ secrets.KEYSTORE_BASE64 }}
-      SP: ${{ secrets.KEYSTORE_PASSWORD }}
-      KA: ${{ secrets.KEY_ALIAS }}
-      KP: ${{ secrets.KEY_PASSWORD }}
-      GH_TOKEN: ${{ github.token }}
-      NOTES: ${{ github.event.head_commit.message }}
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Find the Aura project
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Android SDK tools
+        shell: bash
         run: |
-          set -e
-          f="$WANTED"
-          if [ -n "$f" ] && [ ! -f "$f" ]; then
-            echo "::error::The zip '$f' is not in the repo"
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK was not found"
             exit 1
           fi
-          if [ -z "$f" ]; then
-            f=$(git log --name-only --diff-filter=AM --pretty=format: -- '*.zip' '*.git' | sed '/^$/d' | head -1)
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+              -type f -name sdkmanager -print -quit 2>/dev/null || true)"
           fi
-          rm -rf project
-          mkdir project
-          if [ -n "$f" ] && [ -f "$f" ]; t
+
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "::error::Android sdkmanager was not found"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses \
+            >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Find the Aura project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK="$GITHUB_WORKSPACE/.aura-build"
+
+          rm -rf "$WORK"
+          mkdir -p "$WORK/unpacked"
+
+          f="${WANTED:-}"
+
+          if [[ -n "$f" && ! -f "$f" ]]; then
+            echo "::error::The ZIP '$f' is not in the repository"
+            exit 1
+          fi
+
+          if [[ -z "$f" ]]; then
+            f="$(git log -1 --name-only --diff-filter=AM \
+              --pretty=format: -- '*.zip' \
+              | sed '/^$/d' | head -n 1 || true)"
+          fi
+
+          if [[ -n "$f" ]]; then
+            echo "Using ZIP: $f"
+
+            unzip -q "$f" -d "$WORK/unpacked"
+
+            manifest="$(find "$WORK/unpacked" \
+              -type f \
+              -path '*/launcher/src/main/AndroidManifest.xml' \
+              -print -quit)"
+          else
+            echo "No ZIP found; looking for launcher/ in the repository"
+
+            manifest="$(find "$GITHUB_WORKSPACE" \
+              -path "$GITHUB_WORKSPACE/.git" -prune -o \
+              -path "$WORK" -prune -o \
+              -type f \
+              -path '*/launcher/src/main/AndroidManifest.xml' \
+              -print -quit)"
+          fi
+
+          if [[ -z "${manifest:-}" || ! -f "$manifest" ]]; then
+            echo "::error::Could not find launcher/src/main/AndroidManifest.xml"
+            exit 1
+          fi
+
+          project_root="${manifest%/launcher/src/main/AndroidManifest.xml}"
+
+          echo "Aura project root: $project_root"
+
+          echo "src=$project_root/launcher/src/main" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned APK
+        id: build
+        shell: bash
+        env:
+          AURA_SRC: ${{ steps.project.outputs.src }}
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="$ANDROID_SDK_ROOT"
+          BT="$SDK_ROOT/build-tools/35.0.0"
+          ANDROID_JAR="$SDK_ROOT/platforms/android-35/android.jar"
+          OUT="$GITHUB_WORKSPACE/.aura-build/out"
+          SRC="$AURA_SRC"
+
+          for tool in aapt2 d8 zipalign apksigner; do
+            if [[ ! -x "$BT/$tool" ]]; then
+              echo "::error::Missing Android build tool: $BT/$tool"
+              exit 1
+            fi
+          done
+
+          if [[ ! -f "$ANDROID_JAR" || \
+                ! -f "$BT/core-lambda-stubs.jar" ]]; then
+            echo "::error::Android SDK installation is incomplete"
+            exit 1
+          fi
+
+          if [[ ! -f "$SRC/AndroidManifest.xml" || \
+                ! -d "$SRC/java" || ! -d "$SRC/res" ]]; then
+            echo "::error::Aura source tree is incomplete: $SRC"
+            exit 1
+          fi
+
+          mkdir -p \
+            "$OUT/gen" \
+            "$OUT/classes" \
+            "$OUT/dex" \
+            "$GITHUB_WORKSPACE/dist"
+
+          rm -rf "$OUT/gen" "$OUT/classes" "$OUT/dex"
+
+          mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex"
+
+          rm -f \
+            "$OUT/res.zip" \
+            "$OUT/base.apk" \
+            "$OUT/unsigned.apk" \
+            "$OUT/aligned.apk" \
+            "$OUT/classes.jar"
+
+          # Point the in-app updater at this repository.
+          python3 - "$SRC/java/app/aura/home/Updater.java" \
+            "$GITHUB_REPOSITORY" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          repo = sys.argv[2]
+
+          text = path.read_text(encoding="utf-8")
+
+          text, latest_count = re.subn(
+              r'private static final String LATEST = "https://api\.github\.com/repos/[^"]+/releases/latest";',
+              f'private static final String LATEST = "https://api.github.com/repos/{repo}/releases/latest";',
+              text,
+          )
+
+          text, ua_count = re.subn(
+              r'private static final String UA = "AuraTV-updater \(https://github\.com/[^"]+\)";',
+              f'private static final String UA = "AuraTV-updater (https://github.com/{repo})";',
+              text,
+          )
+
+          if latest_count != 1 or ua_count != 1:
+              raise SystemExit(
+                  "Could not safely retarget the Aura updater repository"
+              )
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          VERSION_CODE="$GITHUB_RUN_NUMBER"
+          VERSION_NAME="$VERSION_PREFIX.$GITHUB_RUN_NUMBER"
+
+          echo "Compiling Android resources"
+
+          "$BT/aapt2" compile \
+            --dir "$SRC/res" \
+            -o "$OUT/res.zip"
+
+          echo "Linking Android resources"
+
+          "$BT/aapt2" link \
+            -o "$OUT/base.apk" \
+            -I "$ANDROID_JAR" \
+            --manifest "$SRC/AndroidManifest.xml" \
+            --java "$OUT/gen" \
+            --min-sdk-version "$MIN_SDK" \
+            --target-sdk-version "$TARGET_SDK" \
+            --version-code "$VERSION_CODE" \
+            --version-name "$VERSION_NAME" \
+            "$OUT/res.zip"
+
+          mapfile -d '' JAVA_SOURCES < <(
+            find "$SRC/java" "$OUT/gen" \
+              -type f -name '*.java' -print0
+          )
+
+          if [[ ${#JAVA_SOURCES[@]} -eq 0 ]]; then
+            echo "::error::No Java source files found"
+            exit 1
+          fi
+
+          echo "Compiling ${#JAVA_SOURCES[@]} Java source files"
+
+          javac \
+            -g:none \
+            -nowarn \
+            -Xlint:-options \
+            -encoding UTF-8 \
+            -source 8 \
+            -target 8 \
+            -bootclasspath "$ANDROID_JAR:$BT/core-lambda-stubs.jar" \
+            -classpath "$ANDROID_JAR" \
+            -d "$OUT/classes" \
+            "${JAVA_SOURCES[@]}"
+
+          jar --create \
+            --file "$OUT/classes.jar" \
+            -C "$OUT/classes" .
+
+          echo "Converting Java classes to DEX"
+
+          "$BT/d8" \
+            --release \
+            --min-api "$MIN_SDK" \
+            --lib "$ANDROID_JAR" \
+            --output "$OUT/dex" \
+            "$OUT/classes.jar"
+
+          cp "$OUT/base.apk" "$OUT/unsigned.apk"
+
+          (
+            cd "$OUT/dex"
+            zip -q -0 "$OUT/unsigned.apk" classes.dex
+          )
+
+          if [[ -d "$SRC/assets" ]]; then
+            (
+              cd "$SRC"
+              zip -q -0 -r "$OUT/unsigned.apk" assets
+            )
+          fi
+
+          "$BT/zipalign" \
+            -p -f 4 \
+            "$OUT/unsigned.apk" \
+            "$OUT/aligned.apk"
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Sign APK
+        id: sign
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BT="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          OUT="$GITHUB_WORKSPACE/.aura-build/out"
+          KEYSTORE="$OUT/aura.keystore"
+
+          if [[ -n "${KEYSTORE_BASE64:-}" && \
+                -n "${KEYSTORE_PASSWORD:-}" && \
+                -n "${KEY_ALIAS:-}" && \
+                -n "${KEY_PASSWORD:-}" ]]; then
+
+            printf '%s' "$KEYSTORE_BASE64" \
+              | base64 --decode > "$KEYSTORE"
+
+            chmod 600 "$KEYSTORE"
+
+            "$BT/apksigner" sign \
+              --ks "$KEYSTORE" \
+              --ks-pass env:KEYSTORE_PASSWORD \
+              --ks-key-alias "$KEY_ALIAS" \
+              --key-pass env:KEY_PASSWORD \
+              --out "$GITHUB_WORKSPACE/dist/Aura.apk" \
+              "$OUT/aligned.apk"
+
+            echo "release_ok=true" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "Using a temporary signing key."
+
+            TEMP_PASS="AuraTemp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -alias aura \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$TEMP_PASS" \
+              -keypass "$TEMP_PASS" \
+              -dname "CN=Aura Home Temporary Build"
+
+            "$BT/apksigner" sign \
+              --ks "$KEYSTORE" \
+              --ks-pass "pass:$TEMP_PASS" \
+              --ks-key-alias aura \
+              --key-pass "pass:$TEMP_PASS" \
+              --out "$GITHUB_WORKSPACE/dist/Aura.apk" \
+              "$OUT/aligned.apk"
+
+            echo "release_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          "$BT/apksigner" verify \
+            --verbose \
+            "$GITHUB_WORKSPACE/dist/Aura.apk"
+
+          unzip -t "$GITHUB_WORKSPACE/dist/Aura.apk" >/dev/null
+
+          echo "APK ready: dist/Aura.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aura-${{ steps.build.outputs.version_name }}
+          path: dist/Aura.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: steps.sign.outputs.release_ok == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.version_name }}
+          name: Aura ${{ steps.build.outputs.version_name }}
+          generate_release_notes: true
+          files: dist/Aura.apk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
